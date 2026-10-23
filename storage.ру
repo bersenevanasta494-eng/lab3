@@ -1,0 +1,451 @@
+"""Модуль 4 — хранение данных.
+
+Разделено на два слоя:
+
+* :class:`FileStorage` — низкоуровневая работа с CSV-файлами (создание каталога,
+  чтение строк, атомарная запись через временный файл);
+* :class:`DataRepository` — доменные объекты в памяти, CRUD-операции и проверка
+  целостности ссылок (категория операции должна существовать, участник — тоже).
+
+Все коллекции живут в оперативной памяти и сбрасываются на диск при изменении,
+что соответствует требованию «чтение данных при запуске приложения».
+"""
+
+from __future__ import annotations
+
+import csv
+from decimal import Decimal
+from pathlib import Path
+from typing import Callable, Iterable, Sequence
+
+from .models import (
+    BudgetLimit,
+    Category,
+    Member,
+    NotFoundError,
+    StorageError,
+    Transaction,
+    TransactionType,
+    ValidationError,
+    category_key,
+    new_id,
+    normalize_amount,
+    normalize_date,
+    normalize_month,
+    parse_type,
+)
+
+TRANSACTIONS_FILE = "transactions"
+CATEGORIES_FILE = "categories"
+BUDGETS_FILE = "budgets"
+MEMBERS_FILE = "members"
+SETTINGS_FILE = "settings"
+
+DEFAULT_CURRENCY = "руб."
+DEFAULT_OPENING_BALANCE = Decimal("0.00")
+
+_ALL_FILES = (TRANSACTIONS_FILE, CATEGORIES_FILE, BUDGETS_FILE, MEMBERS_FILE, SETTINGS_FILE)
+
+
+class FileStorage:
+    """Хранит каждую коллекцию в отдельном CSV-файле внутри одного каталога."""
+
+    def __init__(self, directory: str | Path) -> None:
+        self.directory = Path(directory)
+
+    # -- служебное ---------------------------------------------------------- #
+    def path(self, name: str) -> Path:
+        return self.directory / f"{name}.csv"
+
+    def ensure_directory(self) -> None:
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise StorageError(f"Не удалось создать каталог «{self.directory}»: {exc}") from exc
+
+    # -- чтение / запись ---------------------------------------------------- #
+    def read(self, name: str, columns: Sequence[str]) -> list[dict[str, str]]:
+        """Прочитать CSV-файл и вернуть список словарей со строковыми значениями."""
+        self.ensure_directory()
+        path = self.path(name)
+        if not path.exists():
+            return []
+
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                header = tuple(reader.fieldnames or ())
+                if header and set(columns) - set(header):
+                    missing = ", ".join(sorted(set(columns) - set(header)))
+                    raise StorageError(
+                        f"Файл «{path.name}» повреждён: отсутствуют столбцы ({missing})."
+                    )
+                rows: list[dict[str, str]] = []
+                for raw in reader:
+                    row: dict[str, str] = {}
+                    for column in columns:
+                        value = raw.get(column)
+                        row[column] = "" if value is None else str(value).strip()
+                    rows.append(row)
+                return rows
+        except OSError as exc:
+            raise StorageError(f"Не удалось прочитать файл «{path.name}»: {exc}") from exc
+        except UnicodeDecodeError as exc:
+            raise StorageError(f"Файл «{path.name}» не в кодировке UTF-8: {exc}") from exc
+
+    def write(self, name: str, columns: Sequence[str], rows: Iterable[dict[str, str]]) -> None:
+        """Атомарно перезаписать CSV-файл: сначала во временный, затем rename."""
+        self.ensure_directory()
+        path = self.path(name)
+        temp = path.with_name(path.name + ".tmp")
+        try:
+            with temp.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(columns), lineterminator="\n")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({column: row.get(column, "") for column in columns})
+            temp.replace(path)
+        except OSError as exc:
+            temp.unlink(missing_ok=True)
+            raise StorageError(f"Не удалось сохранить файл «{path.name}»: {exc}") from exc
+
+    def exists(self) -> bool:
+        """Есть ли хотя бы один файл с данными."""
+        return any(self.path(name).exists() for name in _ALL_FILES)
+
+
+class DataRepository:
+    """Доменный репозиторий: CRUD над транзакциями, категориями, лимитами и участниками."""
+
+    TRANSACTION_COLUMNS = ("id", "date", "type", "amount", "category", "member", "comment")
+    CATEGORY_COLUMNS = ("id", "name", "kind")
+    BUDGET_COLUMNS = ("id", "category", "month", "limit")
+    MEMBER_COLUMNS = ("id", "name")
+    SETTINGS_COLUMNS = ("key", "value")
+
+    def __init__(self, storage: FileStorage) -> None:
+        self.storage = storage
+        self.transactions: list[Transaction] = []
+        self.categories: list[Category] = []
+        self.budgets: list[BudgetLimit] = []
+        self.members: list[Member] = []
+        self.settings: dict[str, str] = {}
+        self._dirty: set[str] = set()
+
+    # -- загрузка / сохранение --------------------------------------------- #
+    def load(self) -> None:
+        """Прочитать все CSV-файлы в память. Вызывается один раз при старте."""
+        self.transactions = self._load_collection(
+            TRANSACTIONS_FILE, self.TRANSACTION_COLUMNS, self._transaction_from_row
+        )
+        self.categories = self._load_collection(
+            CATEGORIES_FILE, self.CATEGORY_COLUMNS, self._category_from_row
+        )
+        self.budgets = self._load_collection(BUDGETS_FILE, self.BUDGET_COLUMNS, self._budget_from_row)
+        self.members = self._load_collection(MEMBERS_FILE, self.MEMBER_COLUMNS, self._member_from_row)
+        self.settings = {
+            row["key"]: row["value"]
+            for row in self.storage.read(SETTINGS_FILE, self.SETTINGS_COLUMNS)
+            if row["key"]
+        }
+        self._dirty.clear()
+
+    def _load_collection(self, name: str, columns: Sequence[str], factory) -> list:
+        rows = self.storage.read(name, columns)
+        records = []
+        for index, row in enumerate(rows, start=2):
+            try:
+                records.append(factory(row))
+            except (ValidationError, ValueError) as exc:
+                raise StorageError(
+                    f"Файл «{self.storage.path(name).name}», строка {index}: {exc}"
+                ) from exc
+        return records
+
+    def mark_dirty(self, name: str) -> None:
+        self._dirty.add(name)
+
+    def save(self, force: bool = False) -> list[str]:
+        """Записать изменённые коллекции на диск. Возвращает список имён файлов."""
+        names = sorted(self._dirty) if not force else list(_ALL_FILES)
+        for name in names:
+            self._write_collection(name)
+        self._dirty.clear()
+        return names
+
+    def _write_collection(self, name: str) -> None:
+        if name == TRANSACTIONS_FILE:
+            rows = [self._transaction_to_row(item) for item in self.transactions]
+            self.storage.write(name, self.TRANSACTION_COLUMNS, rows)
+        elif name == CATEGORIES_FILE:
+            rows = [self._category_to_row(item) for item in self.categories]
+            self.storage.write(name, self.CATEGORY_COLUMNS, rows)
+        elif name == BUDGETS_FILE:
+            rows = [self._budget_to_row(item) for item in self.budgets]
+            self.storage.write(name, self.BUDGET_COLUMNS, rows)
+        elif name == MEMBERS_FILE:
+            rows = [self._member_to_row(item) for item in self.members]
+            self.storage.write(name, self.MEMBER_COLUMNS, rows)
+        elif name == SETTINGS_FILE:
+            rows = [{"key": key, "value": value} for key, value in sorted(self.settings.items())]
+            self.storage.write(name, self.SETTINGS_COLUMNS, rows)
+
+    def is_empty(self) -> bool:
+        return not (
+            self.transactions or self.categories or self.budgets or self.members
+        )
+
+    # -- преобразование строк <-> объекты ----------------------------------- #
+    @staticmethod
+    def _transaction_from_row(row: dict[str, str]) -> Transaction:
+        return Transaction(
+            id=row["id"] or new_id(),
+            amount=normalize_amount(row["amount"]),
+            type=parse_type(row["type"]),
+            category=row["category"],
+            date=normalize_date(row["date"]),
+            member=row["member"],
+            comment=row["comment"],
+        )
+
+    @staticmethod
+    def _transaction_to_row(item: Transaction) -> dict[str, str]:
+        return {
+            "id": item.id,
+            "date": item.date.isoformat(),
+            "type": item.type.value,
+            "amount": f"{item.amount:.2f}",
+            "category": item.category,
+            "member": item.member,
+            "comment": item.comment,
+        }
+
+    @staticmethod
+    def _category_from_row(row: dict[str, str]) -> Category:
+        return Category(
+            id=row["id"] or new_id(),
+            name=row["name"],
+            kind=parse_type(row["kind"]) if row["kind"] else TransactionType.EXPENSE,
+        )
+
+    @staticmethod
+    def _category_to_row(item: Category) -> dict[str, str]:
+        return {"id": item.id, "name": item.name, "kind": item.kind.value}
+
+    @staticmethod
+    def _budget_from_row(row: dict[str, str]) -> BudgetLimit:
+        return BudgetLimit(
+            id=row["id"] or new_id(),
+            category=row["category"],
+            month=normalize_month(row["month"]),
+            limit=normalize_amount(row["limit"]),
+        )
+
+    @staticmethod
+    def _budget_to_row(item: BudgetLimit) -> dict[str, str]:
+        return {
+            "id": item.id,
+            "category": item.category,
+            "month": item.month,
+            "limit": f"{item.limit:.2f}",
+        }
+
+    @staticmethod
+    def _member_from_row(row: dict[str, str]) -> Member:
+        return Member(id=row["id"] or new_id(), name=row["name"])
+
+    @staticmethod
+    def _member_to_row(item: Member) -> dict[str, str]:
+        return {"id": item.id, "name": item.name}
+
+    # -- транзакции --------------------------------------------------------- #
+    def add_transaction(self, transaction: Transaction) -> Transaction:
+        self._check_references(transaction)
+        self.transactions.append(transaction)
+        self.mark_dirty(TRANSACTIONS_FILE)
+        return transaction
+
+    def update_transaction(self, transaction: Transaction) -> Transaction:
+        self._check_references(transaction)
+        for index, existing in enumerate(self.transactions):
+            if existing.id == transaction.id:
+                self.transactions[index] = transaction
+                self.mark_dirty(TRANSACTIONS_FILE)
+                return transaction
+        raise NotFoundError(f"Операция с идентификатором {transaction.id} не найдена.")
+
+    def remove_transaction(self, transaction_id: str) -> Transaction:
+        transaction = self.find_transaction(transaction_id)
+        self.transactions.remove(transaction)
+        self.mark_dirty(TRANSACTIONS_FILE)
+        return transaction
+
+    def find_transaction(self, transaction_id: str) -> Transaction:
+        for transaction in self.transactions:
+            if transaction.id == transaction_id:
+                return transaction
+        raise NotFoundError(f"Операция с идентификатором {transaction_id} не найдена.")
+
+    # -- категории ---------------------------------------------------------- #
+    def add_category(self, category: Category) -> Category:
+        if self.find_category(category.name) is not None:
+            raise ValidationError(f"Категория «{category.name}» уже существует.")
+        self.categories.append(category)
+        self.mark_dirty(CATEGORIES_FILE)
+        return category
+
+    def remove_category(self, name: str) -> Category:
+        category = self.require_category(name)
+        used = self.category_usage(category.name)
+        if used["transactions"] or used["budgets"]:
+            raise ValidationError(
+                f"Нельзя удалить категорию «{category.name}»: она используется в "
+                f"{used['transactions']} операциях и {used['budgets']} лимитах."
+            )
+        self.categories.remove(category)
+        self.mark_dirty(CATEGORIES_FILE)
+        return category
+
+    def find_category(self, name: str) -> Category | None:
+        key = category_key(name)
+        for category in self.categories:
+            if category.key == key:
+                return category
+        return None
+
+    def require_category(self, name: str) -> Category:
+        category = self.find_category(name)
+        if category is None:
+            raise ValidationError(f"Категория «{name.strip()}» не найдена в списке категорий.")
+        return category
+
+    def categories_of(self, kind: TransactionType | None = None) -> list[Category]:
+        if kind is None:
+            return sorted(self.categories, key=lambda item: item.name.casefold())
+        return sorted(
+            (item for item in self.categories if item.kind is kind),
+            key=lambda item: item.name.casefold(),
+        )
+
+    def category_usage(self, name: str) -> dict[str, int]:
+        key = category_key(name)
+        return {
+            "transactions": sum(
+                1 for item in self.transactions if category_key(item.category) == key
+            ),
+            "budgets": sum(1 for item in self.budgets if category_key(item.category) == key),
+        }
+
+    # -- участники ---------------------------------------------------------- #
+    def add_member(self, member: Member) -> Member:
+        if self.find_member(member.name) is not None:
+            raise ValidationError(f"Участник «{member.name}» уже есть в списке.")
+        self.members.append(member)
+        self.mark_dirty(MEMBERS_FILE)
+        return member
+
+    def remove_member(self, name: str) -> Member:
+        member = self.require_member(name)
+        used = self.member_usage(member.name)
+        if used:
+            raise ValidationError(
+                f"Нельзя удалить участника «{member.name}»: на него записано {used} операций."
+            )
+        self.members.remove(member)
+        self.mark_dirty(MEMBERS_FILE)
+        return member
+
+    def find_member(self, name: str) -> Member | None:
+        key = " ".join(name.split()).casefold()
+        for member in self.members:
+            if member.key == key:
+                return member
+        return None
+
+    def require_member(self, name: str) -> Member:
+        member = self.find_member(name)
+        if member is None:
+            raise ValidationError(f"Участник «{name.strip()}» не найден в списке участников.")
+        return member
+
+    def member_names(self) -> list[str]:
+        return sorted((member.name for member in self.members), key=str.casefold)
+
+    def member_usage(self, name: str) -> int:
+        key = " ".join(name.split()).casefold()
+        return sum(1 for item in self.transactions if item.member.casefold() == key)
+
+    # -- лимиты ------------------------------------------------------------- #
+    def save_budget(self, limit: BudgetLimit) -> BudgetLimit:
+        self.require_category(limit.category)
+        key = category_key(limit.category)
+        for index, existing in enumerate(self.budgets):
+            if category_key(existing.category) == key and existing.month == limit.month:
+                self.budgets[index] = limit
+                self.mark_dirty(BUDGETS_FILE)
+                return limit
+        self.budgets.append(limit)
+        self.mark_dirty(BUDGETS_FILE)
+        return limit
+
+    def remove_budget(self, category: str, month: str) -> BudgetLimit:
+        limit = self.find_budget(category, month)
+        if limit is None:
+            raise NotFoundError(
+                f"Лимит для категории «{category}» на месяц {month} не установлен."
+            )
+        self.budgets.remove(limit)
+        self.mark_dirty(BUDGETS_FILE)
+        return limit
+
+    def find_budget(self, category: str, month: str) -> BudgetLimit | None:
+        key = category_key(category)
+        canonical = normalize_month(month)
+        for limit in self.budgets:
+            if category_key(limit.category) == key and limit.month == canonical:
+                return limit
+        return None
+
+    def budgets_of_month(self, month: str | None = None) -> list[BudgetLimit]:
+        canonical = normalize_month(month) if month else None
+        items = [
+            item for item in self.budgets
+            if canonical is None or item.month == canonical
+        ]
+        return sorted(items, key=lambda item: (item.month, category_key(item.category)))
+
+    # -- настройки ---------------------------------------------------------- #
+    @property
+    def currency(self) -> str:
+        return self.settings.get("currency") or DEFAULT_CURRENCY
+
+    @property
+    def opening_balance(self) -> Decimal:
+        """Стартовый остаток. В отличие от сумм операций, допускает отрицательное значение."""
+        raw = self.settings.get("opening_balance")
+        if not raw:
+            return DEFAULT_OPENING_BALANCE
+        try:
+            return Decimal(raw.strip()).quantize(Decimal("0.01"))
+        except (ArithmeticError, ValueError):
+            return DEFAULT_OPENING_BALANCE
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.settings[key] = value
+        self.mark_dirty(SETTINGS_FILE)
+
+    # -- проверка ссылочной целостности ------------------------------------- #
+    def _check_references(self, transaction: Transaction) -> None:
+        category = self.require_category(transaction.category)
+        if category.kind is not transaction.type:
+            expected = "доходов" if category.kind is TransactionType.INCOME else "расходов"
+            raise ValidationError(
+                f"Категория «{category.name}» предназначена только для {expected}, "
+                f"а операция помечена как {transaction.type.label.lower()}."
+            )
+        member = self.require_member(transaction.member)
+        # Приводим написание к каноническому из справочников, иначе в отчётах
+        # одна и та же категория могла бы попасть под разными именами.
+        transaction.category = category.name
+        transaction.member = member.name
+
