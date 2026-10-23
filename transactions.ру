@@ -1,0 +1,151 @@
+"""Модуль 1 — управление транзакциями."""
+
+from __future__ import annotations
+
+from datetime import date
+from decimal import Decimal
+from typing import Iterable, Sequence
+
+from ..models import (
+    NotFoundError,
+    Transaction,
+    TransactionType,
+    ValidationError,
+    category_key,
+)
+from ..storage import DataRepository
+
+
+class TransactionService:
+    """Добавление, редактирование, удаление и поиск операций."""
+
+    def __init__(self, repository: DataRepository) -> None:
+        self.repository = repository
+
+    # -- команды ------------------------------------------------------------ #
+    def add(
+        self,
+        *,
+        amount: Decimal | str,
+        type: TransactionType,
+        category: str,
+        date: date,
+        member: str,
+        comment: str = "",
+    ) -> Transaction:
+        """Создать операцию. Сумма передаётся положительной, тип задаёт знак."""
+        transaction = Transaction(
+            amount=amount,
+            type=type,
+            category=category.strip(),
+            date=date,
+            member=member.strip(),
+            comment=comment,
+        )
+        return self.repository.add_transaction(transaction)
+
+    def edit(self, transaction_id: str, **changes) -> Transaction:
+        """Изменить поля операции. Значение ``None`` означает «оставить как есть»."""
+        allowed = {"amount", "type", "category", "date", "member", "comment"}
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValidationError(
+                "Нельзя изменить поля: " + ", ".join(sorted(unknown))
+            )
+        payload = {key: value for key, value in changes.items() if value is not None}
+        if not payload:
+            raise ValidationError("Не передано ни одно поле для изменения.")
+        updated = self.get(transaction_id).replace(**payload)
+        return self.repository.update_transaction(updated)
+
+    def delete(self, transaction_id: str) -> Transaction:
+        """Удалить операцию и вернуть её для подтверждения в интерфейсе."""
+        return self.repository.remove_transaction(transaction_id)
+
+    def get(self, transaction_id: str) -> Transaction:
+        return self.repository.find_transaction(transaction_id)
+
+    # -- запросы ------------------------------------------------------------ #
+    def all(self) -> list[Transaction]:
+        return list(self.repository.transactions)
+
+    def query(
+        self,
+        *,
+        start: date | None = None,
+        end: date | None = None,
+        category: str | None = None,
+        member: str | None = None,
+        type: TransactionType | None = None,
+        text: str | None = None,
+        newest_first: bool = True,
+    ) -> list[Transaction]:
+        """Отфильтровать операции. Период включается в границы с обеих сторон."""
+        if start and end and start > end:
+            raise ValidationError("Начало периода позже его конца.")
+
+        found: Iterable[Transaction] = self.repository.transactions
+        if start:
+            found = [item for item in found if item.date >= start]
+        if end:
+            found = [item for item in found if item.date <= end]
+        if category:
+            key = category_key(category)
+            found = [item for item in found if category_key(item.category) == key]
+        if member:
+            key = member.casefold()
+            found = [item for item in found if item.member.casefold() == key]
+        if type:
+            found = [item for item in found if item.type is type]
+        if text:
+            needle = text.casefold().strip()
+            found = [item for item in found if self._matches(item, needle)]
+
+        # Разворачиваем список ввода, чтобы стабильная сортировка по дате
+        # выдала внутри одного дня операции в порядке «последняя добавленная первой».
+        items = list(found)
+        if newest_first:
+            items.reverse()
+        return sorted(items, key=lambda item: item.date, reverse=newest_first)
+
+    @staticmethod
+    def _matches(transaction: Transaction, needle: str) -> bool:
+        haystack = " ".join(
+            (transaction.comment, transaction.category, transaction.member)
+        ).casefold()
+        return needle in haystack
+
+    def find_similar(self, candidate: Transaction) -> list[Transaction]:
+        """Найти операции, полностью совпадающие с ``candidate``.
+
+        Используется интерфейсом, чтобы предупредить о вероятном двойном вводе.
+        """
+        return [
+            item
+            for item in self.repository.transactions
+            if item.date == candidate.date
+            and item.amount == candidate.amount
+            and item.type is candidate.type
+            and category_key(item.category) == category_key(candidate.category)
+            and item.member.casefold() == candidate.member.casefold()
+        ]
+
+    def totals(self, transactions: Sequence[Transaction]) -> dict[str, Decimal]:
+        """Суммы доходов, расходов и итога по переданным операциям."""
+        income = sum(
+            (item.amount for item in transactions if item.type is TransactionType.INCOME),
+            Decimal("0.00"),
+        )
+        expenses = sum(
+            (item.amount for item in transactions if item.type is TransactionType.EXPENSE),
+            Decimal("0.00"),
+        )
+        return {"income": income, "expenses": expenses, "net": income - expenses}
+
+    def select(self, transaction_id: str) -> Transaction:
+        """Синоним :meth:`get`, оставлен для читаемости вызывающего кода."""
+        try:
+            return self.get(transaction_id)
+        except NotFoundError:
+            raise
+
