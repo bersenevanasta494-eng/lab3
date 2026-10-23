@@ -1,0 +1,350 @@
+"""Модуль 3 — аналитика и финансовые отчёты."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Sequence
+
+from ..formatting import bullet_list, heading, money, percent, signed_money
+from ..models import (
+    Transaction,
+    TransactionType,
+    category_key,
+    format_month,
+    month_bounds,
+    normalize_month,
+    parse_signed_amount,
+)
+from ..storage import DataRepository
+
+ZERO = Decimal("0.00")
+
+
+@dataclass(frozen=True, slots=True)
+class CategorySlice:
+    """Сумма расходов по одной категории за период."""
+
+    category: str
+    total: Decimal
+    count: int
+    share: Decimal = ZERO
+
+    @property
+    def average(self) -> Decimal:
+        if not self.count:
+            return ZERO
+        return (self.total / self.count).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+@dataclass(frozen=True, slots=True)
+class MonthlyRow:
+    """Сводка по одному календарному месяцу."""
+
+    month: str
+    income: Decimal
+    expenses: Decimal
+    count: int
+
+    @property
+    def net(self) -> Decimal:
+        return self.income - self.expenses
+
+    @property
+    def label(self) -> str:
+        return format_month(self.month)
+
+
+@dataclass(frozen=True, slots=True)
+class FinancialReport:
+    """Готовый к печати отчёт за выбранный период."""
+
+    title: str
+    start: date
+    end: date
+    income: Decimal
+    expenses: Decimal
+    opening_balance: Decimal
+    transactions: int
+    by_category: tuple[CategorySlice, ...] = field(default_factory=tuple)
+    top: tuple[CategorySlice, ...] = field(default_factory=tuple)
+    currency: str = "руб."
+
+    @property
+    def period(self) -> str:
+        if self.start == self.end:
+            return self.start.strftime("%d.%m.%Y")
+        return f"{self.start:%d.%m.%Y} — {self.end:%d.%m.%Y}"
+
+    @property
+    def net(self) -> Decimal:
+        return self.income - self.expenses
+
+    @property
+    def period_balance(self) -> Decimal:
+        """Сколько денег осталось после операций периода."""
+        return self.opening_balance + self.net
+
+    @property
+    def avg_daily_expense(self) -> Decimal:
+        days = (self.end - self.start).days + 1
+        if days <= 0:
+            return ZERO
+        return (self.expenses / days).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    @property
+    def savings_rate(self) -> Decimal:
+        """Доля доходов, оставшаяся после расходов."""
+        if self.income <= 0:
+            return ZERO
+        return (self.net / self.income).quantize(Decimal("0.0001"))
+
+    def render(self) -> str:
+        lines = [
+            heading(self.title),
+            f"Период: {self.period}",
+            f"Операций:  {self.transactions}",
+            "",
+            f"Доходы:    {money(self.income, self.currency)}",
+            f"Расходы:   {money(self.expenses, self.currency)}",
+            f"Итог:      {signed_money(self.net, self.currency)}",
+            "",
+            f"Остаток на начало: {money(self.opening_balance, self.currency)}",
+            f"Остаток на конец:  {money(self.period_balance, self.currency)}",
+            f"В среднем в день:  {money(self.avg_daily_expense, self.currency)}",
+            f"Доля сбережений:   {percent(self.savings_rate, 1)}",
+            "",
+        ]
+
+        if self.top:
+            lines.append(f"Топ-{len(self.top)} самых затратных категорий:")
+            for position, item in enumerate(self.top, start=1):
+                lines.append(
+                    f"  {position}. {item.category} — {money(item.total, self.currency)} "
+                    f"({percent(item.share)}, {item.count} оп.)"
+                )
+            lines.append("")
+
+        if self.by_category:
+            lines.append("Все категории:")
+            lines.extend(
+                f"  • {item.category} — {money(item.total, self.currency)} "
+                f"({percent(item.share)})"
+                for item in self.by_category
+            )
+        else:
+            lines.append("Расходов за период не зафиксировано.")
+
+        return "\n".join(lines)
+
+
+class AnalyticsService:
+    """Агрегации над историей операций."""
+
+    def __init__(self, repository: DataRepository) -> None:
+        self.repository = repository
+
+    # -- баланс ------------------------------------------------------------- #
+    def balance(self) -> Decimal:
+        """Общий баланс: стартовый остаток плюс все доходы минус все расходы."""
+        total = self.repository.opening_balance
+        for transaction in self.repository.transactions:
+            total += transaction.signed_amount
+        return total.quantize(Decimal("0.01"))
+
+    def opening_balance(self) -> Decimal:
+        return self.repository.opening_balance
+
+    def set_opening_balance(self, value: Decimal | str) -> Decimal:
+        amount = parse_signed_amount(value)
+        self.repository.set_setting("opening_balance", f"{amount:.2f}")
+        return self.repository.opening_balance
+
+    # -- период ------------------------------------------------------------- #
+    def transactions_between(self, start: date, end: date) -> list[Transaction]:
+        if start > end:
+            raise ValueError("Начало периода позже его конца.")
+        return [
+            item
+            for item in self.repository.transactions
+            if start <= item.date <= end
+        ]
+
+    def income(self, start: date | None = None, end: date | None = None) -> Decimal:
+        return sum(
+            (
+                item.amount
+                for item in self._slice(start, end)
+                if item.type is TransactionType.INCOME
+            ),
+            ZERO,
+        )
+
+    def expenses(self, start: date | None = None, end: date | None = None) -> Decimal:
+        return sum(
+            (
+                item.amount
+                for item in self._slice(start, end)
+                if item.type is TransactionType.EXPENSE
+            ),
+            ZERO,
+        )
+
+    def net(self, start: date | None = None, end: date | None = None) -> Decimal:
+        return self.income(start, end) - self.expenses(start, end)
+
+    def _slice(self, start: date | None, end: date | None) -> Sequence[Transaction]:
+        if start is None and end is None:
+            return self.repository.transactions
+        if start is None:
+            start = date.min
+        if end is None:
+            end = date.max
+        return [item for item in self.repository.transactions if start <= item.date <= end]
+
+    # -- категории ---------------------------------------------------------- #
+    def by_category(
+        self, start: date | None = None, end: date | None = None
+    ) -> list[CategorySlice]:
+        """Расходы по категориям за период, отсортированные по убыванию суммы."""
+        totals: dict[str, list] = {}
+        for transaction in self._slice(start, end):
+            if transaction.type is not TransactionType.EXPENSE:
+                continue
+            key = category_key(transaction.category)
+            bucket = totals.setdefault(key, [transaction.category, ZERO, 0])
+            bucket[1] += transaction.amount
+            bucket[2] += 1
+
+        overall = sum((bucket[1] for bucket in totals.values()), ZERO)
+        slices = [
+            CategorySlice(
+                category=canonical,
+                total=total.quantize(Decimal("0.01")),
+                count=count,
+                share=(total / overall).quantize(Decimal("0.0001")) if overall else ZERO,
+            )
+            for canonical, total, count in totals.values()
+        ]
+        return sorted(slices, key=lambda item: (item.total, item.category.casefold()), reverse=True)
+
+    def top_categories(
+        self, start: date | None = None, end: date | None = None, count: int = 3
+    ) -> list[CategorySlice]:
+        """Топ-N самых затратных категорий за период."""
+        if count <= 0:
+            raise ValueError("Количество категорий должно быть положительным.")
+        return self.by_category(start, end)[:count]
+
+    # -- месяцы ------------------------------------------------------------- #
+    def monthly(self, start: date, end: date) -> list[MonthlyRow]:
+        """Сводка по каждому месяцу, в который попал хотя бы один месяц периода."""
+        buckets: dict[str, dict] = {}
+        cursor = f"{start.year:04d}-{start.month:02d}"
+        last = f"{end.year:04d}-{end.month:02d}"
+        while cursor <= last:
+            buckets[cursor] = {"income": ZERO, "expenses": ZERO, "count": 0}
+            year, month = (int(part) for part in cursor.split("-"))
+            cursor = f"{year + 1}-01" if month == 12 else f"{year}-{month + 1:02d}"
+
+        for transaction in self.repository.transactions:
+            bucket = buckets.get(transaction.month)
+            if bucket is None or not (start <= transaction.date <= end):
+                continue
+            key = "income" if transaction.type is TransactionType.INCOME else "expenses"
+            bucket[key] += transaction.amount
+            bucket["count"] += 1
+
+        return [
+            MonthlyRow(
+                month=month,
+                income=data["income"].quantize(Decimal("0.01")),
+                expenses=data["expenses"].quantize(Decimal("0.01")),
+                count=data["count"],
+            )
+            for month, data in sorted(buckets.items())
+        ]
+
+    # -- отчёты ------------------------------------------------------------- #
+    def build_report(
+        self,
+        start: date,
+        end: date,
+        title: str | None = None,
+        top: int = 3,
+    ) -> FinancialReport:
+        """Собрать :class:`FinancialReport` за период."""
+        if start > end:
+            raise ValueError("Начало периода позже его конца.")
+        data = self.transactions_between(start, end)
+        by_category = self.by_category(start, end)
+        return FinancialReport(
+            title=title or f"Отчёт за {start:%d.%m.%Y} — {end:%d.%m.%Y}",
+            start=start,
+            end=end,
+            income=self.income(start, end),
+            expenses=self.expenses(start, end),
+            opening_balance=self.opening_balance(),
+            transactions=len(data),
+            by_category=tuple(by_category),
+            top=tuple(by_category[:top]),
+            currency=self.repository.currency,
+        )
+
+    def month_report(self, month: str, top: int = 3) -> FinancialReport:
+        """Отчёт за один календарный месяц."""
+        canonical = normalize_month(month)
+        start, end = month_bounds(canonical)
+        return self.build_report(start, end, title=f"Отчёт: {format_month(canonical)}", top=top)
+
+    def member_report(self, member: str, start: date, end: date, top: int = 3) -> FinancialReport:
+        """Отчёт по операциям конкретного участника семьи."""
+        key = member.casefold()
+        data = [
+            item
+            for item in self.transactions_between(start, end)
+            if item.member.casefold() == key
+        ]
+        totals: dict[str, list] = {}
+        for transaction in data:
+            if transaction.type is not TransactionType.EXPENSE:
+                continue
+            bucket = totals.setdefault(category_key(transaction.category), [transaction.category, ZERO, 0])
+            bucket[1] += transaction.amount
+            bucket[2] += 1
+        overall = sum((bucket[1] for bucket in totals.values()), ZERO)
+        slices = tuple(
+            sorted(
+                (
+                    CategorySlice(
+                        category=canonical,
+                        total=total.quantize(Decimal("0.01")),
+                        count=count,
+                        share=(total / overall).quantize(Decimal("0.0001")) if overall else ZERO,
+                    )
+                    for canonical, total, count in totals.values()
+                ),
+                key=lambda item: (item.total, item.category.casefold()),
+                reverse=True,
+            )
+        )
+        income = sum(
+            (item.amount for item in data if item.type is TransactionType.INCOME), ZERO
+        )
+        expenses = sum(
+            (item.amount for item in data if item.type is TransactionType.EXPENSE), ZERO
+        )
+        return FinancialReport(
+            title=f"Отчёт: {member}",
+            start=start,
+            end=end,
+            income=income.quantize(Decimal("0.01")),
+            expenses=expenses.quantize(Decimal("0.01")),
+            opening_balance=self.opening_balance(),
+            transactions=len(data),
+            by_category=slices,
+            top=slices[:top],
+            currency=self.repository.currency,
+        )
+
