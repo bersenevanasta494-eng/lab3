@@ -1,0 +1,131 @@
+"""Тестовый драйвер (Test Driver) для BudgetModule."""
+from budget_module import BudgetModule, BudgetStatus
+
+def run_tests():
+    bm = BudgetModule()
+    passed = 0
+    failed = 0
+
+    def check(name, actual, expected):
+        nonlocal passed, failed
+        if actual == expected:
+            print(f"  [OK] {name}")
+            passed += 1
+        else:
+            print(f"  [FAIL] {name}: expected {expected!r}, got {actual!r}")
+            failed += 1
+
+    # --- Happy path ---
+    print("=== Happy path ===")
+    bm.set_limit("Продукты", "2026-10", 1000)
+    bm.add_expense("Продукты", "2026-10", 300)
+    bm.add_expense("Продукты", "2026-10", 200)
+    st = bm.status("Продукты", "2026-10")
+    check("spent == 500", st.spent, __import__("decimal").Decimal("500.00"))
+    check("remaining == 500", st.remaining, __import__("decimal").Decimal("500.00"))
+    check("state == ok", st.state, "ok")
+    check("is_exceeded == False", st.is_exceeded, False)
+
+    # --- Превышение лимита ---
+    print("=== Превышение лимита ===")
+    bm2 = BudgetModule()
+    bm2.set_limit("Транспорт", "2026-10", 500)
+    bm2.add_expense("Транспорт", "2026-10", 600)
+    st2 = bm2.status("Транспорт", "2026-10")
+    check("is_exceeded == True", st2.is_exceeded, True)
+    check("state == exceeded", st2.state, "exceeded")
+    check("check() содержит ПРЕВЫШЕН", "ПРЕВЫШЕН" in bm2.check("Транспорт", "2026-10"), True)
+
+    # --- Близко к лимиту (>= 80%) ---
+    print("=== Близко к лимиту ===")
+    bm3 = BudgetModule()
+    bm3.set_limit("Развлечения", "2026-10", 1000)
+    bm3.add_expense("Развлечения", "2026-10", 850)
+    st3 = bm3.status("Развлечения", "2026-10")
+    check("is_close == True", st3.is_close, True)
+    check("state == close", st3.state, "close")
+
+    # --- Негативное тестирование: пустая категория ---
+    print("=== Негативное: пустая категория ===")
+    try:
+        bm.set_limit("", "2026-10", 100)
+        print("  [FAIL] Ожидалось исключение ValueError")
+        failed += 1
+    except ValueError:
+        print("  [OK] ValueError при пустой категории")
+        passed += 1
+
+    # --- Негативное: отрицательный лимит ---
+    print("=== Негативное: отрицательный лимит ===")
+    try:
+        bm.set_limit("X", "2026-10", -50)
+        print("  [FAIL] Ожидалось исключение ValueError")
+        failed += 1
+    except ValueError:
+        print("  [OK] ValueError при отрицательном лимите")
+        passed += 1
+
+    # --- Негативное: отрицательный расход ---
+    print("=== Негативное: отрицательный расход ===")
+    try:
+        bm.add_expense("Продукты", "2026-10", -100)
+        print("  [FAIL] Ожидалось исключение ValueError")
+        failed += 1
+    except ValueError:
+        print("  [OK] ValueError при отрицательном расходе")
+        passed += 1
+
+    # --- Негативное: лимит 0 (BUG-01) ---
+    print("=== Негативное: лимит 0 (BUG-01) ===")
+    bm4 = BudgetModule()
+    bm4.set_limit("Тест", "2026-10", 0)
+    bm4.add_expense("Тест", "2026-10", 50)
+    try:
+        st4 = bm4.status("Тест", "2026-10")
+        print(f"  [OK] Нет исключения: state={st4.state}, usage={st4.usage}")
+        passed += 1
+    except ZeroDivisionError:
+        print("  [FAIL] ZeroDivisionError (BUG-01 не исправлен)")
+        failed += 1
+
+    # --- Негативное: сумма с запятой (BUG-02) ---
+    print("=== Негативное: сумма с запятой (BUG-02) ===")
+    bm5 = BudgetModule()
+    bm5.set_limit("Тест2", "2026-10", "1000,50")
+    bm5.add_expense("Тест2", "2026-10", "250,25")
+    st5 = bm5.status("Тест2", "2026-10")
+    check("spent == 250.25", st5.spent, __import__("decimal").Decimal("250.25"))
+    check("limit == 1000.50", st5.limit, __import__("decimal").Decimal("1000.50"))
+
+    # --- Стресс-тест: длинная строка ---
+    print("=== Стресс-тест: длинная категория ===")
+    long_cat = "К" * 1000
+    bm6 = BudgetModule()
+    bm6.set_limit(long_cat, "2026-10", 100)
+    print(f"  [OK] Длинная категория принята")
+    passed += 1
+
+    # --- statuses / exceeded / near_limit ---
+    print("=== Сводка по месяцу ===")
+    bm7 = BudgetModule()
+    bm7.set_limit("Еда", "2026-10", 1000)
+    bm7.set_limit("Транспорт", "2026-10", 500)
+    bm7.add_expense("Еда", "2026-10", 900)
+    bm7.add_expense("Транспорт", "2026-10", 550)
+    check("exceeded count == 1", len(bm7.exceeded("2026-10")), 1)
+    check("near_limit count == 1", len(bm7.near_limit("2026-10")), 1)
+    check("statuses count == 2", len(bm7.statuses("2026-10")), 2)
+
+    # --- remove_limit ---
+    print("=== Снятие лимита ===")
+    bm8 = BudgetModule()
+    bm8.set_limit("X", "2026-10", 100)
+    bm8.remove_limit("X", "2026-10")
+    check("limit == 0 after remove", bm8.status("X", "2026-10").limit, __import__("decimal").Decimal("0.00"))
+
+    print(f"\nИтог: {passed} пройдено, {failed} провалено.")
+    return failed == 0
+
+if __name__ == "__main__":
+    ok = run_tests()
+    raise SystemExit(0 if ok else 1)
