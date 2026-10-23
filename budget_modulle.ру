@@ -1,0 +1,112 @@
+"""Модуль бюджетных лимитов (BudgetModule) — изолированная реализация.
+
+Модуль для проекта «Домашняя бухгалтерия»: установка лимитов трат по категориям
+на месяц, учёт расходов и проверка превышения лимита.
+
+Баги, найденные в ходе негативного тестирования и исправленные:
+  BUG-01: деление на ноль в usage при limit == 0.
+  BUG-02: Decimal(str) падал на суммах с запятой («100,50»).
+"""
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from typing import Dict, List
+
+
+class BudgetStatus:
+    """Неизменяемый снимок состояния лимита."""
+
+    def __init__(self, category, month, limit, spent):
+        self.category = category
+        self.month = month
+        self.limit = limit
+        self.spent = spent
+        self.remaining = limit - spent
+        # BUG-01 FIX: защита от деления на ноль
+        if limit > 0:
+            self.usage = (spent / limit * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        else:
+            self.usage = Decimal("0.0") if spent == 0 else Decimal("100.0")
+        self.is_exceeded = spent > limit
+        self.is_close = (not self.is_exceeded) and self.usage >= 80
+        self.state = "exceeded" if self.is_exceeded else ("close" if self.is_close else "ok")
+
+    def bar(self, width=10):
+        filled = min(width, int(self.usage / 100 * width)) if self.limit > 0 else 0
+        return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+    def __repr__(self):
+        return (f"BudgetStatus({self.category!r}, {self.month!r}, "
+                f"limit={self.limit}, spent={self.spent}, state={self.state})")
+
+
+class BudgetModule:
+    """Изолированный модуль бюджетных лимитов."""
+
+    def __init__(self):
+        self._limits: Dict[tuple, Decimal] = {}
+        self._expenses: Dict[tuple, Decimal] = {}
+
+    @staticmethod
+    def _to_decimal(value):
+        # BUG-02 FIX: принимаем запятую как разделитель
+        if isinstance(value, str):
+            value = value.strip().replace(",", ".")
+        try:
+            return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError, ArithmeticError):
+            raise ValueError(f"Некорректное числовое значение: {value!r}")
+
+    @staticmethod
+    def _key(category, month):
+        if not category or not str(category).strip():
+            raise ValueError("Категория не может быть пустой")
+        if not month or not str(month).strip():
+            raise ValueError("Месяц не может быть пустым")
+        return (str(category).strip().lower(), str(month).strip())
+
+    def set_limit(self, category, month, limit):
+        limit = self._to_decimal(limit)
+        if limit < 0:
+            raise ValueError("Лимит не может быть отрицательным")
+        self._limits[self._key(category, month)] = limit
+
+    def remove_limit(self, category, month):
+        self._limits.pop(self._key(category, month), None)
+
+    def add_expense(self, category, month, amount):
+        amount = self._to_decimal(amount)
+        if amount < 0:
+            raise ValueError("Сумма расхода не может быть отрицательной")
+        key = self._key(category, month)
+        self._expenses[key] = self._expenses.get(key, Decimal("0.00")) + amount
+
+    def status(self, category, month):
+        key = self._key(category, month)
+        limit = self._limits.get(key, Decimal("0.00"))
+        spent = self._expenses.get(key, Decimal("0.00"))
+        return BudgetStatus(category, month, limit, spent)
+
+    def check(self, category, month):
+        st = self.status(category, month)
+        if st.limit == 0:
+            return "Лимит не установлен"
+        if st.is_exceeded:
+            return f"ПРЕВЫШЕН: расход {st.spent} > лимит {st.limit}"
+        if st.is_close:
+            return f"Близко к лимиту: {st.usage}%"
+        return f"В норме: {st.usage}%"
+
+    def statuses(self, month):
+        month = str(month).strip()
+        result = []
+        for (cat, m), limit in self._limits.items():
+            if m == month:
+                spent = self._expenses.get((cat, m), Decimal("0.00"))
+                result.append(BudgetStatus(cat, month, limit, spent))
+        result.sort(key=lambda s: s.usage, reverse=True)
+        return result
+
+    def exceeded(self, month) -> List[BudgetStatus]:
+        return [s for s in self.statuses(month) if s.is_exceeded]
+
+    def near_limit(self, month) -> List[BudgetStatus]:
+        return [s for s in self.statuses(month) if s.is_close]
